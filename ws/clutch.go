@@ -7,9 +7,15 @@ import (
 	"fmt"
 	"log/slog"
 	"sync/atomic"
-
-	"github.com/gorilla/websocket"
 )
+
+// Conn is the interface for the underlying WebSocket connection.
+// *websocket.Conn from gorilla/websocket satisfies this implicitly.
+type Conn interface {
+	ReadMessage() (messageType int, p []byte, err error)
+	WriteMessage(messageType int, data []byte) error
+	Close() error
+}
 
 // Clutch correlates request/response pairs over a single WebSocket connection.
 // It uses an actor-based concurrency model: the readLoop owns all mutable
@@ -17,7 +23,7 @@ import (
 // through channels. The caller owns the wire format — Clutch only manages
 // the correlation ID field.
 type Clutch struct {
-	conn     *websocket.Conn
+	conn     Conn
 	idField  string
 	nextID   atomic.Uint64
 	requests chan request          // unbuffered — registration before write
@@ -29,7 +35,7 @@ type Clutch struct {
 // NewClutch wraps an existing WebSocket connection and starts the
 // read and write actor goroutines. The idField parameter names the
 // top-level JSON field used for request/response correlation.
-func NewClutch(conn *websocket.Conn, idField string) *Clutch {
+func NewClutch(conn Conn, idField string) *Clutch {
 	c := &Clutch{
 		conn:     conn,
 		idField:  idField,
@@ -184,7 +190,7 @@ func (c *Clutch) writeLoop() {
 	for {
 		select {
 		case raw := <-c.writes:
-			if err := c.conn.WriteMessage(websocket.TextMessage, raw); err != nil {
+			if err := c.conn.WriteMessage(1, raw); err != nil { // 1 = text frame
 				return
 			}
 		case <-c.done:
