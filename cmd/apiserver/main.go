@@ -9,9 +9,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/gorilla/websocket"
-	"wsreq/ws"
+	"clutch/ws"
 )
 
 func main() {
@@ -23,8 +24,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("dial ws: %v", err)
 	}
-	client := ws.NewClient(conn)
-	defer client.Close()
+	clutch := ws.NewClutch(conn, "id")
+	defer clutch.Close()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/request", func(w http.ResponseWriter, r *http.Request) {
@@ -33,16 +34,13 @@ func main() {
 			return
 		}
 
-		var body struct {
-			Method  string          `json:"method"`
-			Payload json.RawMessage `json:"payload"`
-		}
+		var body json.RawMessage
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		resp, err := client.Request(r.Context(), body.Method, body.Payload)
+		resp, err := clutch.Request(r.Context(), body)
 		if err != nil {
 			if r.Context().Err() != nil {
 				http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
@@ -53,7 +51,8 @@ func main() {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		w.Write(resp)
+		w.Write([]byte("\n"))
 	})
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
@@ -65,8 +64,10 @@ func main() {
 	go func() {
 		<-sigCh
 		log.Println("shutting down...")
-		client.Close()
-		srv.Shutdown(context.Background())
+		clutch.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
 	}()
 
 	log.Printf("apiserver listening on %s (ws: %s)", *addr, *wsURL)

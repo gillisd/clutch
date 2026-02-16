@@ -21,15 +21,28 @@ mkdir -p "$BINDIR"
 go build -o "$BINDIR/wsecho"    ./cmd/wsecho
 go build -o "$BINDIR/apiserver" ./cmd/apiserver
 
+wait_for_port() {
+    local port=$1
+    local attempts=20
+    for i in $(seq 1 $attempts); do
+        if (echo >/dev/tcp/localhost/$port) 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "FAIL: port $port did not become available" >&2
+    exit 1
+}
+
 # Start wsecho server.
 exec 3< <("$BINDIR/wsecho" -addr :19090 2>&1)
 ECHO_PID=$!
-sleep 0.5
+wait_for_port 19090
 
 # Start apiserver.
 exec 4< <("$BINDIR/apiserver" -addr :18080 -ws ws://localhost:19090/ws 2>&1)
 API_PID=$!
-sleep 0.5
+wait_for_port 18080
 
 check() {
     local name=$1 expected=$2 actual=$3

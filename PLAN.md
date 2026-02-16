@@ -1,78 +1,105 @@
-# WebSocket Request/Response Bridge — Implementation Plan
+# WebSocket Request/Response Correlator — Implementation Plan
 
 ## Overview
 
-Build a Go library and HTTP API server that bridges HTTP request/response semantics onto a WebSocket connection. A caller makes a `curl POST` with a JSON body, the server forwards it over a persistent WebSocket connection, and returns the WebSocket reply as the HTTP response. Requests and responses are correlated by an `id` field in the message envelope.
+A Go library and HTTP API server that correlates request/response pairs over a WebSocket connection. The library (`ws.Clutch`) is wire-format agnostic — it injects a correlation ID into outbound JSON, extracts it from inbound JSON, and returns the raw response. The caller owns the wire format.
 
 ## Architecture
 
 ```
-curl POST ──► HTTP API Server ──► WS Client ──► WebSocket Server
-                                    │
-                              (matches response
-                               by id, returns
-                               to HTTP handler)
+curl POST ──► HTTP API Server ──► ws.Clutch ──► WebSocket Server
+                                      │
+                                (injects ID, matches
+                                 response by ID,
+                                 returns raw JSON)
 ```
 
 ## Core Design: Actor-Based, No Mutexes
 
-The WebSocket client uses a pure channel-based actor model. No `sync.Mutex` anywhere.
+The `Clutch` uses a pure channel-based actor model. No `sync.Mutex` anywhere.
 
 ### Goroutines (Actors)
 
 There are 4 goroutines:
 
-1. **Caller goroutine** (HTTP handler) — creates a `request` struct with its own `respCh`, sends sequentially to reader then writer, blocks on `respCh`.
-2. **Reader actor** — owns the `pending` map (private state). Receives registration requests from callers AND incoming WS messages. Matches responses to pending requests by ID.
-3. **Writer actor** — owns the write side of the WS connection. Receives messages from a buffered channel and writes them to the socket one at a time.
-4. **WS read pump** — a helper goroutine that turns blocking `conn.ReadJSON()` calls into channel sends, so the reader actor can `select` over both registrations and incoming messages.
+1. **Caller goroutine** — creates a `request` struct with its own `respCh`, sends sequentially to reader then writer, blocks on `respCh`.
+2. **Reader actor** — owns the `pending` map (private state). Receives registration requests from callers, incoming WS messages, and cancel notifications. Matches responses to pending requests by ID.
+3. **Writer actor** — owns the write side of the WS connection. Receives raw JSON from a buffered channel and writes it to the socket.
+4. **WS read pump** — a helper goroutine that turns blocking `conn.ReadMessage()` calls into channel sends, so the reader actor can `select` over both registrations and incoming messages.
 
 ### Channel Topology
 
 ```
-Caller ──(unbuffered)──► Reader actor ──(buffered)──► Writer actor
-                            ▲
-                            │ (unbuffered)
-                        WS read pump
+Caller ──(unbuffered)──► Reader actor
+Caller ──(buffered)────► Writer actor
+Caller ──(buffered)────► Reader actor (cancels)
+WS read pump ──(unbuffered)──► Reader actor
 ```
 
-- `requests chan request` — **unbuffered**. Caller sends to reader. Unbuffered guarantees the reader has registered the pending request before the caller proceeds to do anything else. This is a happens-before edge.
-- `writes chan Message` — **buffered** (e.g. 64). Reader forwards outbound messages here after registering. Multiple callers can enqueue without blocking each other.
-- `incoming chan Message` — **unbuffered**. WS read pump sends decoded messages here for the reader to dispatch.
+- `requests chan request` — **unbuffered**. Caller sends to reader. Unbuffered guarantees the reader has registered the pending request before the caller proceeds. This is a happens-before edge.
+- `writes chan json.RawMessage` — **buffered** (64). Caller hands outbound messages to the writer actor. Multiple callers can enqueue without blocking each other.
+- `cancels chan uint64` — **buffered** (64). Caller sends cancelled request IDs for cleanup by the reader actor. Non-blocking best-effort send prevents callers from hanging.
+- `incoming chan json.RawMessage` — **unbuffered**. WS read pump sends raw messages here for the reader to dispatch.
 - `errs chan error` — **buffered (1)**. WS read pump sends connection errors here.
-- `req.respCh chan Message` — **buffered (1)** per request. Reader sends the matched response here. Buffer of 1 ensures reader never blocks on send.
+- `req.respCh chan json.RawMessage` — **buffered (1)** per request. Reader sends the matched response here. Closed on shutdown.
 
 ### Ordering Guarantee (Why No Race)
 
-The caller sends to `requests` (unbuffered) BEFORE the message reaches the writer. Because the channel is unbuffered, the send blocks until the reader picks it up. The reader registers in `pending`, THEN forwards to `writes`. So registration is structurally guaranteed to happen-before the write. Even if the WS server responds instantly, the reader already has the registration.
+The caller sends to `requests` (unbuffered) BEFORE the message reaches the writer. Because the channel is unbuffered, the send blocks until the reader picks it up. The reader registers in `pending`, then the caller sends to `writes`. So registration is structurally guaranteed to happen-before the write. Even if the WS server responds instantly, the reader already has the registration.
 
-### Caller Flow
+### Caller Flow (3-Select Design)
+
+The caller performs three sequential selects:
+1. **Register** — send to unbuffered `requests` channel (happens-before write).
+2. **Write** — send to buffered `writes` channel (handed to writer actor).
+3. **Wait** — block on per-request `respCh` for the response.
+
+Cancel paths after step 1 send the request ID to the `cancels` channel (best-effort, non-blocking) so the reader actor can clean up the pending map entry.
 
 ```go
-func (c *Client) Request(ctx context.Context, method string, payload any) (*Message, error) {
+func (c *Clutch) Request(ctx context.Context, msg json.RawMessage) (json.RawMessage, error) {
     id := c.nextID.Add(1)
-    data, _ := json.Marshal(payload)
-
-    req := request{
-        msg:    Message{ID: id, Method: method, Payload: data},
-        respCh: make(chan Message, 1),
+    raw, err := injectID(c.idField, msg, id)
+    if err != nil {
+        return nil, fmt.Errorf("inject ID: %w", err)
     }
 
-    // Sequential send to unbuffered channel — blocks until reader registers it.
+    req := request{
+        id:     id,
+        raw:    raw,
+        respCh: make(chan json.RawMessage, 1),
+    }
+
+    // Step 1: Register with the reader actor.
     select {
     case c.requests <- req:
+    case <-c.done:
+        return nil, errors.New("client closed")
     case <-ctx.Done():
         return nil, ctx.Err()
     }
 
-    // Block until response or timeout.
+    // Step 2: Hand the message to the writer actor.
     select {
-    case resp := <-req.respCh:
-        if resp.Error != "" {
-            return nil, fmt.Errorf("remote: %s", resp.Error)
-        }
-        return &resp, nil
+    case c.writes <- req.raw:
+    case <-c.done:
+        return nil, errors.New("client closed")
     case <-ctx.Done():
+        select { case c.cancels <- id: default: }
+        return nil, ctx.Err()
+    }
+
+    // Step 3: Wait for the response.
+    select {
+    case resp, ok := <-req.respCh:
+        if !ok {
+            return nil, errors.New("client closed")
+        }
+        return resp, nil
+    case <-c.done:
+        return nil, errors.New("client closed")
+    case <-ctx.Done():
+        select { case c.cancels <- id: default: }
         return nil, ctx.Err()
     }
 }
@@ -80,40 +107,65 @@ func (c *Client) Request(ctx context.Context, method string, payload any) (*Mess
 
 ### Reader Actor
 
+The reader actor owns the `pending` map and handles the `cancels` channel to clean up entries for cancelled requests. On exit, its defer closes `c.done` (if not already closed) and drains all pending requests by closing their response channels.
+
+Messages with unparseable or missing IDs are logged and dropped.
+
 ```go
-func (c *Client) readLoop() {
-    pending := make(map[uint64]request)  // private state, no mutex
-    incoming := make(chan Message)
+func (c *Clutch) readLoop() {
+    pending := make(map[uint64]request)
+    incoming := make(chan json.RawMessage)
     errs := make(chan error, 1)
 
-    // WS read pump — turns blocking reads into channel sends.
     go func() {
         for {
-            var msg Message
-            if err := c.conn.ReadJSON(&msg); err != nil {
+            _, data, err := c.conn.ReadMessage()
+            if err != nil {
                 errs <- err
                 return
             }
-            incoming <- msg
+            select {
+            case incoming <- json.RawMessage(data):
+            case <-c.done:
+                return
+            }
+        }
+    }()
+
+    defer func() {
+        select {
+        case <-c.done:
+        default:
+            close(c.done)
+        }
+        for _, req := range pending {
+            close(req.respCh)
         }
     }()
 
     for {
         select {
         case req := <-c.requests:
-            pending[req.msg.ID] = req
-            c.writes <- req.msg  // forward to writer
+            pending[req.id] = req
 
-        case msg := <-incoming:
-            if req, ok := pending[msg.ID]; ok {
-                req.respCh <- msg
-                delete(pending, msg.ID)
+        case raw := <-incoming:
+            id, err := extractID(c.idField, raw)
+            if err != nil {
+                slog.Warn("dropping message: cannot extract correlation ID", ...)
+                continue
+            }
+            if req, ok := pending[id]; ok {
+                req.respCh <- raw
+                delete(pending, id)
             }
 
-        case err := <-errs:
-            for _, req := range pending {
-                req.respCh <- Message{Error: err.Error()}
-            }
+        case id := <-c.cancels:
+            delete(pending, id)
+
+        case <-errs:
+            return
+
+        case <-c.done:
             return
         }
     }
@@ -122,11 +174,25 @@ func (c *Client) readLoop() {
 
 ### Writer Actor
 
+The writer actor closes `c.done` on exit (via defer) so that a write error propagates to the rest of the system. This mirrors the reader actor's defer pattern and prevents callers from hanging indefinitely when the write side dies.
+
 ```go
-func (c *Client) writeLoop() {
-    for msg := range c.writes {
-        if err := c.conn.WriteJSON(msg); err != nil {
-            return  // connection dead
+func (c *Clutch) writeLoop() {
+    defer func() {
+        select {
+        case <-c.done:
+        default:
+            close(c.done)
+        }
+    }()
+    for {
+        select {
+        case raw := <-c.writes:
+            if err := c.conn.WriteMessage(websocket.TextMessage, raw); err != nil {
+                return
+            }
+        case <-c.done:
+            return
         }
     }
 }
@@ -135,15 +201,16 @@ func (c *Client) writeLoop() {
 ## Project Structure
 
 ```
-wsreq/
+clutch/
 ├── go.mod
 ├── go.sum
 ├── ws/
-│   ├── client.go       # Client struct, NewClient, Request, Close
-│   └── message.go      # Message envelope type
+│   ├── clutch.go       # Clutch struct, NewClutch, Request, Close
+│   ├── clutch_test.go  # Unit tests
+│   └── message.go      # Internal helpers: injectID, extractID, request struct
 ├── cmd/
 │   ├── apiserver/
-│   │   └── main.go     # HTTP API server
+│   │   └── main.go     # HTTP API server (raw JSON passthrough)
 │   └── wsecho/
 │       └── main.go     # Echo WebSocket server (for testing)
 └── test/
@@ -157,150 +224,73 @@ wsreq/
 ```go
 package ws
 
-import "encoding/json"
-
-type Message struct {
-    ID      uint64          `json:"id"`
-    Method  string          `json:"method,omitempty"`
-    Payload json.RawMessage `json:"payload,omitempty"`
-    Error   string          `json:"error,omitempty"`
-}
-
 type request struct {
-    msg    Message
-    respCh chan Message
+    id     uint64
+    raw    json.RawMessage
+    respCh chan json.RawMessage
 }
+
+func injectID(idField string, data json.RawMessage, id uint64) (json.RawMessage, error)
+func extractID(idField string, data json.RawMessage) (uint64, error)
 ```
 
-### `ws/client.go`
+### `ws/clutch.go`
 
 ```go
 package ws
 
-type Client struct {
+type Clutch struct {
     conn     *websocket.Conn
+    idField  string
     nextID   atomic.Uint64
-    requests chan request    // unbuffered
-    writes   chan Message    // buffered
-    done     chan struct{}   // signals shutdown
+    requests chan request          // unbuffered
+    writes   chan json.RawMessage  // buffered 64
+    cancels  chan uint64           // buffered 64
+    done     chan struct{}
 }
 ```
 
 Methods:
-- `NewClient(conn *websocket.Conn) *Client` — starts readLoop and writeLoop goroutines.
-- `Request(ctx context.Context, method string, payload any) (*Message, error)` — sends a request and blocks until response.
-- `Close() error` — closes the WS connection, which causes readLoop to exit via the error path, which unblocks all pending callers.
+- `NewClutch(conn *websocket.Conn, idField string) *Clutch` — starts readLoop and writeLoop goroutines.
+- `Request(ctx context.Context, msg json.RawMessage) (json.RawMessage, error)` — injects correlation ID, sends, and blocks until response.
+- `Close() error` — idempotent shutdown.
 
 ## HTTP API Server (`cmd/apiserver/main.go`)
 
-- Accepts a flag or env var for the WS server URL to connect to (default: `ws://localhost:9090/ws`).
-- Accepts a flag for HTTP listen address (default: `:8080`).
-- On startup: dials the WebSocket server, creates a `ws.Client`.
-- Single endpoint: `POST /request`
-  - Reads JSON body as `json.RawMessage`.
-  - Optionally reads `method` from a query param or JSON field.
-  - Calls `client.Request(ctx, method, payload)` with the request's context (so client disconnects = cancellation).
-  - Returns the response payload as JSON with appropriate status code.
-
-Example usage:
-```bash
-curl -X POST http://localhost:8080/request \
-  -H "Content-Type: application/json" \
-  -d '{"method": "echo", "payload": {"hello": "world"}}'
-```
+- Dials the WebSocket server, creates a `ws.Clutch` with `"id"` as the correlation field.
+- Single endpoint: `POST /request` — reads raw JSON body, passes through to `clutch.Request()`, writes raw response.
+- Pure transparent proxy — knows nothing about the application-level schema.
 
 ## Echo WebSocket Server (`cmd/wsecho/main.go`)
 
-A minimal WebSocket server for testing:
-- Upgrades HTTP connections to WebSocket at `/ws`.
-- Reads messages, echoes them back with the same `id` but wraps the payload in `{"echo": <original_payload>}`.
-- This is only for testing; the real WS server will be external.
-
-## Integration Test (`test/integration.sh`)
-
-**Critical requirement:** All server processes MUST be launched via process substitution so they die when the script exits. Do NOT use `&` and `wait`.
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-cd "$PROJECT_DIR"
-
-# Build binaries
-go build -o bin/wsecho ./cmd/wsecho
-go build -o bin/apiserver ./cmd/apiserver
-
-# Start echo WS server via process substitution (auto-killed on script exit)
-exec 3< <(./bin/wsecho -addr :9090)
-# Give it a moment to start
-sleep 1
-
-# Start API server via process substitution
-exec 4< <(./bin/apiserver -addr :8080 -ws ws://localhost:9090/ws)
-sleep 1
-
-# Test 1: Basic echo
-echo "=== Test 1: Basic echo ==="
-RESPONSE=$(curl -s -X POST http://localhost:8080/request \
-  -H "Content-Type: application/json" \
-  -d '{"method": "echo", "payload": {"hello": "world"}}')
-
-echo "Response: $RESPONSE"
-
-# Validate response contains expected data
-if echo "$RESPONSE" | grep -q '"hello"'; then
-  echo "PASS"
-else
-  echo "FAIL"
-  exit 1
-fi
-
-# Test 2: Concurrent requests
-echo "=== Test 2: Concurrent requests ==="
-for i in $(seq 1 10); do
-  curl -s -X POST http://localhost:8080/request \
-    -H "Content-Type: application/json" \
-    -d "{\"method\": \"echo\", \"payload\": {\"n\": $i}}" &
-done
-
-# Wait for all curl processes (these are fine to wait on — they're curl, not servers)
-wait
-
-echo "=== All tests passed ==="
-```
-
-**Important notes for the integration test:**
-- Servers are started with `exec N< <(./command)` — process substitution. When the shell exits, the subshells running the servers are killed.
-- Do NOT use `./server &` — this risks calling `wait` later and hanging forever.
-- Only `wait` on the curl background jobs in Test 2, never on server processes.
-- The `sleep 1` calls give servers time to bind their ports. A more robust version could poll with retries.
+- Defines its own local `message` struct (independent of the `ws` package).
+- Reads messages, echoes them back with the same `id`, wrapping the payload in `{"echo": <original>}`.
 
 ## Shutdown / Cleanup
 
-- `Client.Close()` closes the underlying WS connection.
-- This causes `conn.ReadJSON()` in the read pump to return an error.
-- The read pump sends the error to `errs` and exits.
-- The reader actor receives from `errs`, sends error responses to all pending callers, and exits.
-- The API server should `defer client.Close()` and can close the `writes` channel to signal the writer to exit via `range`.
+- `Clutch.Close()` closes `c.done` and the underlying WS connection.
+- This causes `conn.ReadMessage()` in the read pump to return an error.
+- The reader actor exits, closing all pending response channels.
+- Both actor goroutines exit cleanly via their defer blocks.
+- Write failure: writer goroutine exits and closes `c.done` via its defer, which causes the reader to exit. All callers unblock promptly.
 
 ## Error Handling
 
-- WS connection drops: all pending callers get an error response via their `respCh`.
-- Context cancellation: caller's `select` picks up `ctx.Done()` and returns `ctx.Err()`.
-- Write failure: writer goroutine exits. Subsequent sends to `writes` will block/deadlock unless the reader also shuts down. Consider having the writer signal the reader to shut down on write error (e.g. close a shared `done` channel).
+- WS connection drops: all pending callers get "client closed" error (via channel close).
+- Context cancellation: caller's `select` picks up `ctx.Done()` and returns `ctx.Err()`. Pending entry is cleaned up via `cancels` channel.
+- Write failure: writer closes `c.done`, reader exits, all callers unblock.
+- Application-level errors: the library does not interpret them. Response JSON is returned as-is.
 
 ## Dependencies
 
-- `github.com/gorilla/websocket` — WebSocket implementation.
+- `github.com/gorilla/websocket` — WebSocket implementation (caller's dependency).
 - Standard library only otherwise.
 
 ## Summary of Key Design Decisions
 
-1. **No mutexes.** All shared state is owned by a single goroutine (the reader actor) and accessed only through channels.
-2. **Unbuffered registration channel.** Provides a structural happens-before guarantee that registration precedes the write.
-3. **Buffered write channel.** Decouples callers from the writer so they don't block each other.
-4. **Per-request response channel (buffered 1).** Each caller blocks on its own channel. Buffer of 1 means the reader never blocks when dispatching.
-5. **Process substitution in tests.** Servers auto-terminate when the test script exits. No `&` + `wait` on servers.
+1. **Wire-format agnostic.** The library works with raw `json.RawMessage`. The caller owns the wire format. Only the correlation ID field name is configured.
+2. **No mutexes.** All shared state is owned by a single goroutine (the reader actor) and accessed only through channels.
+3. **Unbuffered registration channel.** Provides a structural happens-before guarantee that registration precedes the write.
+4. **Buffered write channel.** Decouples callers from the writer so they don't block each other.
+5. **Per-request response channel (buffered 1).** Each caller blocks on its own channel. Closed on shutdown to unblock callers.
+6. **Gorilla as external dependency.** The caller owns dialing and brings their own `*websocket.Conn`. Connection lifecycle stays out of the library.

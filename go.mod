@@ -1,4 +1,4 @@
-module wsreq
+module clutch
 
 go 1.23.6
 
