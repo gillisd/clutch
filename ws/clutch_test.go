@@ -59,6 +59,41 @@ func dialClutch(t *testing.T, srv *httptest.Server) *ws.Clutch {
 	return ws.NewClutch(conn, "id")
 }
 
+func echoTLSServer(t *testing.T) (*httptest.Server, func()) {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Logf("upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		for {
+			var msg testMessage
+			if err := conn.ReadJSON(&msg); err != nil {
+				return
+			}
+			if err := conn.WriteJSON(msg); err != nil {
+				return
+			}
+		}
+	}))
+	return srv, srv.Close
+}
+
+func dialClutchTLS(t *testing.T, srv *httptest.Server) *ws.Clutch {
+	t.Helper()
+	url := "wss" + strings.TrimPrefix(srv.URL, "https")
+	dialer := websocket.Dialer{
+		TLSClientConfig: srv.Client().Transport.(*http.Transport).TLSClientConfig,
+	}
+	conn, _, err := dialer.Dial(url, nil)
+	if err != nil {
+		t.Fatalf("dial tls: %v", err)
+	}
+	return ws.NewClutch(conn, "id")
+}
+
 func TestRequest_BasicRoundTrip(t *testing.T) {
 	srv, cleanup := echoServer(t)
 	defer cleanup()
@@ -364,5 +399,285 @@ func TestRequest_ConcurrentClose(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("deadlock: goroutines did not return within 2 seconds")
+	}
+}
+
+func TestRequest_ReconnectAfterServerRestart(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			var msg testMessage
+			if err := conn.ReadJSON(&msg); err != nil {
+				return
+			}
+			if err := conn.WriteJSON(msg); err != nil {
+				return
+			}
+		}
+	})
+
+	// Start first server.
+	srv1 := httptest.NewServer(handler)
+	url1 := "ws" + strings.TrimPrefix(srv1.URL, "http")
+
+	var mu sync.Mutex
+	currentURL := url1
+
+	dial := func() (ws.Conn, error) {
+		mu.Lock()
+		u := currentURL
+		mu.Unlock()
+		conn, _, err := websocket.DefaultDialer.Dial(u, nil)
+		return conn, err
+	}
+
+	conn, err := dial()
+	if err != nil {
+		t.Fatalf("initial dial: %v", err)
+	}
+
+	clutch := ws.NewClutch(conn, "id", ws.WithDialer(dial))
+	defer clutch.Close()
+
+	// First request should work.
+	resp, err := clutch.Request(context.Background(), json.RawMessage(`{"method":"before.restart"}`))
+	if err != nil {
+		t.Fatalf("request before restart: %v", err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(resp, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Kill server 1, start server 2.
+	srv1.Close()
+
+	srv2 := httptest.NewServer(handler)
+	defer srv2.Close()
+
+	mu.Lock()
+	currentURL = "ws" + strings.TrimPrefix(srv2.URL, "http")
+	mu.Unlock()
+
+	// Request after reconnection should succeed.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err = clutch.Request(ctx, json.RawMessage(`{"method":"after.restart"}`))
+	if err != nil {
+		t.Fatalf("request after reconnect: %v", err)
+	}
+
+	if err := json.Unmarshal(resp, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var method string
+	if err := json.Unmarshal(got["method"], &method); err != nil {
+		t.Fatalf("unmarshal method: %v", err)
+	}
+	if method != "after.restart" {
+		t.Errorf("method = %q, want %q", method, "after.restart")
+	}
+}
+
+func TestRequest_PendingRequestsFailOnDisconnect(t *testing.T) {
+	// Server that reads but never responds. We close the WS conn via a signal
+	// channel because httptest.Server.Close() doesn't kill hijacked connections.
+	killConn := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		go func() {
+			<-killConn
+			conn.Close()
+		}()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	// Second server that actually echoes (for post-reconnect).
+	srv2, cleanup2 := echoServer(t)
+	defer cleanup2()
+
+	var mu sync.Mutex
+	currentURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	dial := func() (ws.Conn, error) {
+		mu.Lock()
+		u := currentURL
+		mu.Unlock()
+		conn, _, err := websocket.DefaultDialer.Dial(u, nil)
+		return conn, err
+	}
+
+	conn, err := dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	clutch := ws.NewClutch(conn, "id", ws.WithDialer(dial))
+	defer clutch.Close()
+
+	// Send a request that will never be answered.
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := clutch.Request(context.Background(), json.RawMessage(`{"method":"will.fail"}`))
+		errCh <- err
+	}()
+
+	// Let the request reach the server.
+	time.Sleep(50 * time.Millisecond)
+
+	// Point reconnection at the echo server, then kill the WS connection.
+	mu.Lock()
+	currentURL = "ws" + strings.TrimPrefix(srv2.URL, "http")
+	mu.Unlock()
+	close(killConn)
+
+	// The pending request should fail (server lost state).
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected error for pending request, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pending request did not fail within timeout")
+	}
+
+	// New requests after reconnect should work.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := clutch.Request(ctx, json.RawMessage(`{"method":"after.reconnect"}`))
+	if err != nil {
+		t.Fatalf("request after reconnect: %v", err)
+	}
+
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(resp, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var method string
+	if err := json.Unmarshal(got["method"], &method); err != nil {
+		t.Fatalf("unmarshal method: %v", err)
+	}
+	if method != "after.reconnect" {
+		t.Errorf("method = %q, want %q", method, "after.reconnect")
+	}
+}
+
+func TestRequest_CloseStopsReconnect(t *testing.T) {
+	// Server that immediately closes the connection.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	dial := func() (ws.Conn, error) {
+		conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+		return conn, err
+	}
+
+	conn, err := dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	clutch := ws.NewClutch(conn, "id", ws.WithDialer(dial))
+
+	// Give reconnection loop time to start.
+	time.Sleep(100 * time.Millisecond)
+
+	// Close should stop the reconnection loop and return promptly.
+	done := make(chan struct{})
+	go func() {
+		clutch.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Good — Close returned.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return within 2 seconds — reconnection loop may be stuck")
+	}
+}
+
+func TestRequest_NoReconnectWithoutDialer(t *testing.T) {
+	// Server that closes after one message.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var msg testMessage
+		if err := conn.ReadJSON(&msg); err != nil {
+			return
+		}
+		conn.WriteJSON(msg) // echo once
+	}))
+	defer srv.Close()
+
+	clutch := dialClutch(t, srv)
+	defer clutch.Close()
+
+	// First request works.
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel1()
+	_, err := clutch.Request(ctx1, json.RawMessage(`{"method":"first"}`))
+	if err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+
+	// Second request should fail permanently (no reconnection).
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	_, err = clutch.Request(ctx2, json.RawMessage(`{"method":"second"}`))
+	if err == nil {
+		t.Fatal("expected error on second request, got nil")
+	}
+	if ctx2.Err() != nil {
+		t.Fatalf("should fail promptly, not timeout: %v", ctx2.Err())
+	}
+}
+
+func TestRequest_TLS(t *testing.T) {
+	srv, cleanup := echoTLSServer(t)
+	defer cleanup()
+
+	clutch := dialClutchTLS(t, srv)
+	defer clutch.Close()
+
+	resp, err := clutch.Request(context.Background(), json.RawMessage(`{"method":"tls.echo","payload":{"secure":true}}`))
+	if err != nil {
+		t.Fatalf("request over TLS: %v", err)
+	}
+
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(resp, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var method string
+	if err := json.Unmarshal(got["method"], &method); err != nil {
+		t.Fatalf("unmarshal method: %v", err)
+	}
+	if method != "tls.echo" {
+		t.Errorf("method = %q, want %q", method, "tls.echo")
 	}
 }
