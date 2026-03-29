@@ -1,0 +1,14 @@
+%rec: Issue
+%key: Id
+%typedef: text_t regexp /.*/
+%type: Id int
+%type: Title line
+%type: Description text_t
+%type: Updated date
+%auto: Id Updated
+%mandatory: Title Description
+
+Id: 0
+Updated: Wed, 04 Mar 2026 14:22:56 -0500
+Title: Running cdp with activateclaude causes warnings in stderr of server
+Description: 2026/03/04 14:21:28 WARN dropping message: cannot extract correlation ID error="missing ID field \"id\"" idField=id
