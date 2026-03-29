@@ -2,16 +2,16 @@
 
 Request/response correlation over a single WebSocket connection.
 
-`clutch` provides `ws.Clutch` — a transport-layer correlator that pairs outbound JSON messages with their inbound responses using a configurable ID field. The caller owns the wire format. The library only manages the correlation ID.
+`clutch` ships two things: **`clutchpedal`**, an HTTP-to-WebSocket bridge CLI with auto-reconnection, and **`ws.Clutch`**, the Go library it's built on. The library pairs outbound JSON messages with their inbound responses using a configurable ID field — the caller owns the wire format, the library only manages correlation.
 
 ## Architecture
 
 ```
-curl POST ──> HTTP API Server ──> ws.Clutch ──> WebSocket Server
-                                      │
-                                (injects ID, matches
-                                 response by ID,
-                                 returns raw JSON)
+curl POST ──> clutchpedal ──> ws.Clutch ──> WebSocket Server
+                                   │
+                             (injects ID, matches
+                              response by ID,
+                              returns raw JSON)
 ```
 
 `ws.Clutch` uses an actor-based concurrency model with zero mutexes. All mutable state (the pending-request map) is owned exclusively by the reader goroutine, and communication happens through channels.
@@ -25,13 +25,74 @@ clutch/
 │   ├── clutch_test.go   # Unit tests
 │   └── message.go       # Internal helpers (injectID, extractID)
 ├── cmd/
-│   ├── apiserver/       # HTTP-to-WebSocket bridge
+│   ├── clutchpedal/     # HTTP-to-WebSocket bridge CLI
+│   ├── apiserver/       # Reference HTTP-to-WS bridge
 │   └── wsecho/          # Echo WebSocket server (for testing)
 └── test/
     └── integration.sh   # End-to-end integration tests
 ```
 
 ## Usage
+
+### clutchpedal
+
+`clutchpedal` is a standalone HTTP-to-WebSocket bridge CLI with auto-reconnection and graceful shutdown.
+
+```
+clutchpedal <bind> [--upstream ws://...] [--id-field id] [--insecure]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--upstream` | _(stdio)_ | WebSocket server URL; omit for stdin/stdout mode |
+| `--id-field` | `id` | Correlation ID field name |
+| `--insecure` | `false` | Skip TLS certificate verification for `wss://` endpoints |
+
+Build it:
+
+```bash
+go build -o bin/clutchpedal ./cmd/clutchpedal
+```
+
+Or build all binaries at once:
+
+```bash
+./build.sh
+```
+
+**WebSocket mode** — proxy HTTP requests to an upstream WebSocket server:
+
+```bash
+bin/clutchpedal localhost:8080 --upstream ws://localhost:9090/ws
+
+curl -s -X POST http://localhost:8080/ \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"greet","payload":{"msg":"hello"}}'
+```
+
+The connection automatically reconnects with exponential backoff if the upstream server restarts.
+
+**Stdio mode** — omit `--upstream` to read/write newline-delimited JSON on stdin/stdout:
+
+```bash
+bin/clutchpedal localhost:8080
+```
+
+In this mode, `clutchpedal` bridges HTTP requests to a process connected via pipes rather than a WebSocket server.
+
+**TLS** — use `--insecure` to skip certificate verification for `wss://` endpoints:
+
+```bash
+bin/clutchpedal localhost:8080 --upstream wss://server:9090/ws --insecure
+```
+
+**Custom ID field**:
+
+```bash
+bin/clutchpedal localhost:8080 --upstream ws://localhost:9090/ws --id-field request_id
+```
+
+`clutchpedal` shuts down gracefully on SIGINT/SIGTERM.
 
 ### As a library
 
@@ -120,7 +181,7 @@ go test -race ./...
 Integration tests:
 
 ```bash
-bash test/integration.sh
+./test/integration.sh
 ```
 
 ## Dependencies
