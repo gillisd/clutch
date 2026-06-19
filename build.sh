@@ -3,6 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+go build ./...
 echo "==> Running tests..."
 go test ./... -race -count=1 -v
 
