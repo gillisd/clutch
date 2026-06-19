@@ -1,4 +1,4 @@
-module github.com/gillisd/clutch
+module clutch
 
 go 1.23.6
 
